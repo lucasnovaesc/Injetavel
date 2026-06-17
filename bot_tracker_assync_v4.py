@@ -4,12 +4,13 @@ import time
 import sys
 import threading
 
-class AsyncTrackerV4:
+class AsyncTrackerV5Fixed:
     def __init__(self, pid):
         self.pid = pid
         self.heap_regions = []
         self.candidates = {} 
-        self.active_target = None
+        self.active_coord = None 
+        self.last_votes = 0
         self.lock = threading.Lock()
         self.running = True
         
@@ -29,7 +30,7 @@ class AsyncTrackerV4:
             return False
 
     def background_delta_scanner(self):
-        """Thread Secundária: Varre a memória e alimenta a Thread Principal apenas com o que anda 1 tile."""
+        """Thread Secundária: Filtra o lixo estático e gerencia o ciclo de vida dos candidatos."""
         while self.running:
             self.update_heap_map()
             snapshot = {}
@@ -48,7 +49,7 @@ class AsyncTrackerV4:
             except Exception:
                 pass
                 
-            time.sleep(0.5) # Tempo de respiração mais rápido para respostas mais ágeis
+            time.sleep(0.5) 
             
             movimentados = {}
             try:
@@ -57,11 +58,9 @@ class AsyncTrackerV4:
                         try:
                             mem.seek(addr)
                             nx, ny, nz = struct.unpack('<iii', mem.read(12))
-                            dx, dy = abs(nx - ox), abs(ny - oy)
+                            dx, dy, dz = abs(nx - ox), abs(ny - oy), abs(nz - oz)
                             
-                            # REGRA DE OURO V4: O personagem anda estritamente 1 tile no X ou Y por vez.
-                            # Saltos maiores são artefatos da Câmera ou Minimapa e devem ser ignorados.
-                            if nz == oz and (dx > 0 or dy > 0) and dx <= 1 and dy <= 1:
+                            if (dx > 0 or dy > 0 or dz > 0) and dx <= 1 and dy <= 1 and dz <= 1:
                                 movimentados[addr] = (nx, ny, nz)
                         except Exception:
                             pass
@@ -74,12 +73,18 @@ class AsyncTrackerV4:
                     if addr not in self.candidates:
                         self.candidates[addr] = {'x': nx, 'y': ny, 'z': nz, 'last_move': agora, 'score': 1}
                         
-                # Limpa objetos que estão na lista mas pararam de existir ou não se movem há 5 segundos
-                para_remover = [a for a, d in self.candidates.items() if agora - d['last_move'] > 5.0]
+                # --- ÂNCORA DE INATIVIDADE PROTOCOLO V5 ---
+                # Remove alvos antigos (como monstros que se moveram longe e pararam),
+                # MAS protege os endereços que sustentam a posição atual do jogador.
+                para_remover = []
+                for a, d in self.candidates.items():
+                    if agora - d['last_move'] > 10.0:
+                        if self.active_coord and (d['x'], d['y'], d['z']) == self.active_coord:
+                            continue # Proteção absoluta contra perda de calibragem
+                        para_remover.append(a)
+                        
                 for a in para_remover:
                     del self.candidates[a]
-                    if self.active_target == a:
-                        self.active_target = None
 
     def run_fast_monitor(self):
         if not self.update_heap_map():
@@ -87,9 +92,9 @@ class AsyncTrackerV4:
             return
             
         print("="*65)
-        print(" 🎯 TRACKER V4 (STRICT KINEMATICS & SCORE DECAY) ")
+        print(" 🎯 TRACKER V5 FIXED (PERSISTENT ANCHORAGE) ")
         print("="*65)
-        print("[*] Thread Secundaria Acoplada. Ande no jogo para assumir o controle.")
+        print("[*] Monitoramento online. Dê alguns passos para calibrar o enxame.")
         
         bg_thread = threading.Thread(target=self.background_delta_scanner)
         bg_thread.daemon = True
@@ -113,51 +118,52 @@ class AsyncTrackerV4:
                                 dx, dy, dz = abs(nx - data['x']), abs(ny - data['y']), abs(nz - data['z'])
                                 
                                 if dx > 0 or dy > 0 or dz > 0:
-                                    if dz == 0 and dx <= 1 and dy <= 1:
-                                        data['score'] += 1
+                                    if dx <= 1 and dy <= 1 and dz <= 1:
+                                        data['score'] = 1 
                                         data['last_move'] = agora
-                                    elif dx > 1 or dy > 1 or dz != 0:
-                                        # Sofreu Teleporte. Mantém o objeto mas zera o score de confiança
-                                        data['score'] = 0
-                                        data['last_move'] = agora
-                                        
+                                    else:
+                                        data['score'] = 0 # Invalidado por quebra de física
                                     data['x'], data['y'], data['z'] = nx, ny, nz
                                 else:
-                                    # AMNÉSIA SELETIVA: Se parou por 0.5s, perde a confiança.
-                                    # Isso mata as câmeras e fantasmas que travavam o radar.
-                                    if agora - data['last_move'] > 0.5:
-                                        data['score'] = 0
+                                    # Correção: O score permanece ativo enquanto o objeto for válido na RAM.
+                                    # Eliminada a amnésia de 0.5s que zerava os votos prematuramente.
+                                    pass
                             except Exception:
                                 del self.candidates[addr]
-                                if self.active_target == addr:
-                                    self.active_target = None
                                     
-                        # --- MOTOR DE ELEIÇÃO PURIFICADO ---
-                        ativos = [(a, d) for a, d in self.candidates.items() if d['score'] > 0]
-                        if ativos:
-                            # Elege quem tem o maior Score no momento exato
-                            ativos.sort(key=lambda item: item[1]['score'], reverse=True)
-                            self.active_target = ativos[0][0]
+                        # --- PROCESSAMENTO DO CONSENSO ESPACIAL ---
+                        vote_pool = {}
+                        for addr, data in self.candidates.items():
+                            if data['score'] > 0:
+                                coord = (data['x'], data['y'], data['z'])
+                                vote_pool[coord] = vote_pool.get(coord, 0) + 1
+                                
+                        if vote_pool:
+                            best_coord = max(vote_pool.items(), key=lambda item: item[1])
+                            self.active_coord = best_coord[0]
+                            self.last_votes = best_coord[1]
 
-                    # Display
-                    if self.active_target and self.active_target in self.candidates:
-                        data = self.candidates[self.active_target]
-                        estado = "[ANDANDO]" if data['score'] > 0 else "[PARADO] "
-                        print(f"\r\033[K{estado} X: {data['x']} | Y: {data['y']} | Z: {data['z']}  (Score: {data['score']})", end="")
+                    # Módulo de Exibição Estabilizado
+                    if self.active_coord and self.last_votes >= 4:
+                        x, y, z = self.active_coord
+                        print(f"\r\033[K[RASTREANDO] X: {x} | Y: {y} | Z: {z}  (Votos Consolidados: {self.last_votes})", end="")
+                    elif self.active_coord:
+                        x, y, z = self.active_coord
+                        print(f"\r\033[K[PARADO]     X: {x} | Y: {y} | Z: {z}  (Aguardando re-sincronização)", end="")
                     else:
-                        print(f"\r\033[K[AGUARDANDO] Calibrando sensores... dê um passo.   ", end="")
+                        print(f"\r\033[K[BUSCANDO]   Calibrando enxame... ande um tile.   ", end="")
                         
-                    time.sleep(0.02) # 50Hz de taxa de atualização visual
+                    time.sleep(0.02) # 50Hz
                     
         except KeyboardInterrupt:
             self.running = False
-            print("\n\n[*] Operação finalizada.")
+            print("\n\n[*] Rastreamento encerrado.")
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print("Uso: sudo python3 bot_tracker_v4.py [PID]")
+        print("Uso: sudo python3 bot_tracker_v5_fixed.py [PID]")
         sys.exit(1)
         
     pid = int(sys.argv[1])
-    tracker = AsyncTrackerV4(pid)
+    tracker = AsyncTrackerV5Fixed(pid)
     tracker.run_fast_monitor()
